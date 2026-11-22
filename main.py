@@ -215,6 +215,9 @@ def check_obligation_maturity(
     today = date.today()
     payment_status = record["payment_status"]
 
+    penalty_rate_percent = 2.0  # Illustrative annual penalty rate for this synthetic POC.
+    days_overdue = 0
+
     if payment_status == "PAID":
         maturity_status = "PAID"
         message = "This obligation is marked as paid in the synthetic demo dataset."
@@ -233,18 +236,32 @@ def check_obligation_maturity(
         message = f"This unpaid obligation is overdue by {days_overdue} day(s)."
         next_action = "Review the outstanding payment and contact the relevant team if assistance is required."
 
+    outstanding_amount = float(record["outstanding_amount_inr"])
+    penalty_amount = 0.0
+    if maturity_status == "OVERDUE" and outstanding_amount > 0:
+        penalty_amount = round(
+            outstanding_amount * (penalty_rate_percent / 100) * days_overdue / 365,
+            2
+        )
+
+    total_payable = round(outstanding_amount + penalty_amount, 2)
+
     return {
         "status": "success",
         "obligation_reference_id": record["obligation_reference_id"],
         "obligation_type": record["obligation_type"],
         "due_date": record["due_date"],
-        "outstanding_amount_inr": record["outstanding_amount_inr"],
+        "outstanding_amount_inr": outstanding_amount,
         "payment_status": payment_status,
         "maturity_status": maturity_status,
-        "days_overdue": max((today - due_date).days, 0) if maturity_status == "OVERDUE" else 0,
+        "days_overdue": days_overdue,
+        "penalty_rate_percent": penalty_rate_percent,
+        "penalty_amount_inr": penalty_amount,
+        "total_payable_inr": total_payable,
+        "penalty_calculation_basis": "Simple interest: outstanding amount x annual penalty rate x days overdue / 365. Applied only to unpaid overdue obligations.",
         "message": message,
         "next_action": next_action,
-        "disclaimer": "Synthetic demonstration data only; this is not a live account or payment-status check."
+        "disclaimer": "Synthetic demonstration data only. The 2% per annum penalty rate is illustrative and must not be treated as a contractual or live banking charge."
     }
 
 
