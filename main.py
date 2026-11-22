@@ -1,3 +1,227 @@
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional, Literal
+from uuid import uuid4
+from datetime import datetime, timezone, date
+import os
+
+app = FastAPI(
+    title="TradeSure Voice AI API",
+    description="Demo API for LC discrepancy checking, SCF early-payment estimates, obligation maturity checks, and specialist case creation.",
+    version="2.3"
+)
+
+# Synthetic demo records only. These are not live banking or trade-finance records.
+LC_RECORDS = {
+    "TS-LC-2026-001": {
+        "lc_status": "Discrepancy detected",
+        "discrepancy_type": "Beneficiary name mismatch",
+        "discrepancy_details": (
+            "The beneficiary name in the commercial invoice "
+            "does not match the LC document."
+        ),
+        "document_name": "Commercial Invoice",
+        "next_action": (
+            "Request the corrected commercial invoice "
+            "and forward it to the trade operations team."
+        )
+    },
+    "TS-LC-2026-002": {
+        "lc_status": "Under review",
+        "discrepancy_type": "Document verification pending",
+        "discrepancy_details": (
+            "The submitted bill of lading is awaiting "
+            "verification by the operations team."
+        ),
+        "document_name": "Bill of Lading",
+        "next_action": (
+            "Wait for document verification and contact "
+            "the trade operations team if delayed."
+        )
+    },
+    "TS-LC-2026-003": {
+        "lc_status": "No discrepancy detected",
+        "discrepancy_type": "None",
+        "discrepancy_details": (
+            "All documents in this synthetic demo record "
+            "match the configured LC requirements."
+        ),
+        "document_name": "All submitted documents",
+        "next_action": "Continue with the next processing stage."
+    }
+}
+
+# Short numeric aliases are easier for callers to speak. Keep the original
+# alphanumeric references working for backward compatibility.
+LC_RECORDS.update({
+    "1001": LC_RECORDS["TS-LC-2026-001"],
+    "1002": LC_RECORDS["TS-LC-2026-002"],
+    "1003": LC_RECORDS["TS-LC-2026-003"],
+})
+
+# In-memory demo cases. Records reset whenever the service restarts.
+DEMO_CASES = {}
+
+# Synthetic obligation records for maturity-status demonstrations.
+# Dates are intentionally relative to the demo date (2026-11-22).
+# These are not live banking or customer records.
+OBLIGATION_RECORDS = {
+    "TS-OBL-2026-001": {
+        "obligation_reference_id": "TS-OBL-2026-001",
+        "due_date": "2026-11-25",
+        "outstanding_amount_inr": 125000.00,
+        "payment_status": "UNPAID",
+        "obligation_type": "Trade payment"
+    },
+    "TS-OBL-2026-002": {
+        "obligation_reference_id": "TS-OBL-2026-002",
+        "due_date": "2026-11-22",
+        "outstanding_amount_inr": 85000.00,
+        "payment_status": "UNPAID",
+        "obligation_type": "Supplier invoice"
+    },
+    "TS-OBL-2026-003": {
+        "obligation_reference_id": "TS-OBL-2026-003",
+        "due_date": "2026-11-18",
+        "outstanding_amount_inr": 210000.00,
+        "payment_status": "UNPAID",
+        "obligation_type": "Trade payment"
+    },
+    "TS-OBL-2026-004": {
+        "obligation_reference_id": "TS-OBL-2026-004",
+        "due_date": "2026-11-20",
+        "outstanding_amount_inr": 0.00,
+        "payment_status": "PAID",
+        "obligation_type": "Supplier invoice"
+    }
+}
+
+
+
+class LCRequest(BaseModel):
+    lc_reference_number: str = Field(..., min_length=1)
+
+
+class EarlyPaymentRequest(BaseModel):
+    invoice_amount: float = Field(..., gt=0, description="Invoice amount in INR")
+    annual_rate_percent: float = Field(..., ge=0, le=100)
+    days_early: int = Field(..., gt=0, le=365)
+
+
+class ObligationMaturityRequest(BaseModel):
+    obligation_reference_id: str = Field(..., min_length=1)
+
+
+class SpecialistCaseRequest(BaseModel):
+    case_type: Literal[
+        "EXPORT_LC_DISCREPANCY",
+        "SCF_SUPPLIER_ONBOARDING",
+        "SCF_EARLY_PAYMENT_ENQUIRY",
+        "PAYMENT_NOT_REFLECTED",
+        "PROMISE_TO_PAY",
+        "ROLLOVER_REQUEST",
+        "OTHER"
+    ]
+    caller_role: Literal["EXPORTER", "IMPORTER", "SUPPLIER", "BUYER", "OTHER"]
+    case_summary: str = Field(..., min_length=10, max_length=1000)
+    reference_id: Optional[str] = None
+    urgency: Literal["LOW", "MEDIUM", "HIGH"] = "MEDIUM"
+    callback_requested: bool = False
+    callback_consent: bool = False
+    callback_number: Optional[str] = None
+    preferred_callback_time: Optional[str] = None
+
+
+def verify_demo_api_key(x_api_key: Optional[str]):
+    expected_key = os.getenv("DEMO_API_KEY", "tradesure-demo-key")
+    if not x_api_key or x_api_key != expected_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+@app.get("/")
+def home():
+    return {
+        "status": "running",
+        "service": "TradeSure Voice AI API",
+        "available_endpoints": [
+            "/check-lc-discrepancy",
+            "/calculate-early-payment",
+            "/create-specialist-case",
+            "/check-obligation-maturity"
+        ]
+    }
+
+
+# Existing endpoint: preserve its request and response structure for the
+# Gupshup tool that is already configured.
+def normalize_lc_reference(raw_reference: str) -> str:
+    """Normalise spoken numeric IDs while preserving legacy LC references."""
+    reference = raw_reference.strip().upper()
+    compact = reference.replace(" ", "").replace("-", "")
+
+    # Convert common speech-to-text output such as "one zero zero one".
+    digit_words = {
+        "ZERO": "0", "OH": "0", "O": "0",
+        "ONE": "1", "TWO": "2", "THREE": "3",
+        "FOUR": "4", "FIVE": "5", "SIX": "6",
+        "SEVEN": "7", "EIGHT": "8", "NINE": "9",
+    }
+    tokens = reference.replace("-", " ").replace(",", " ").split()
+    if tokens and all(token in digit_words for token in tokens):
+        spoken_digits = "".join(digit_words[token] for token in tokens)
+        if len(spoken_digits) == 4:
+            return spoken_digits
+
+    # Accept compact numeric form such as 1001, and retain old IDs.
+    if compact.isdigit() and len(compact) == 4:
+        return compact
+    return reference
+
+
+@app.post("/check-lc-discrepancy")
+def check_lc_discrepancy(request: LCRequest):
+    reference = normalize_lc_reference(request.lc_reference_number)
+
+    if reference in LC_RECORDS:
+        return LC_RECORDS[reference]
+
+    return {
+        "lc_status": "Record not found",
+        "discrepancy_type": "Not available",
+        "discrepancy_details": "No matching record exists in the demo dataset.",
+        "document_name": "Not available",
+        "next_action": "Verify the LC reference number or contact the trade operations team."
+    }
+
+
+@app.post("/calculate-early-payment")
+def calculate_early_payment(
+    request: EarlyPaymentRequest,
+    x_api_key: Optional[str] = Header(default=None)
+):
+    verify_demo_api_key(x_api_key)
+
+    # Simple-interest discount estimate using a 365-day year.
+    discount = (
+        request.invoice_amount
+        * (request.annual_rate_percent / 100)
+        * (request.days_early / 365)
+    )
+    estimated_payment = request.invoice_amount - discount
+
+    return {
+        "status": "success",
+        "calculation_type": "Illustrative simple-interest estimate",
+        "invoice_amount_inr": round(request.invoice_amount, 2),
+        "annual_rate_percent": request.annual_rate_percent,
+        "days_early": request.days_early,
+        "estimated_discount_inr": round(discount, 2),
+        "estimated_early_payment_inr": round(estimated_payment, 2),
+        "disclaimer": (
+            "Demo estimate only. Actual discount, fees, eligibility, "
+            "and payment terms are subject to the financier's approval."
+        )
+    }
 
 
 @app.post("/check-obligation-maturity")
